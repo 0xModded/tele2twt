@@ -1,6 +1,3 @@
-# twitterposter.py
-# WARNING: This file contains hardcoded credentials. If these keys are real and have been exposed, rotate them now.
-
 import os
 import hashlib
 import asyncio
@@ -17,19 +14,23 @@ from telegram.ext import (
     CommandHandler,
 )
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
 # ----------------- HARDCODED CONFIG (you asked for this) -----------------
-TELEGRAM_TOKEN = "8277427601:AAE-SVZLETpuoxBUrsAB4_tUbwBOUDpQfb4"
-CHANNEL_USERNAME = "@twitterbotposter".lstrip("@")  # only public channel usernames work
-ADMIN_CHAT_ID = 7556341982
+TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
+CHANNEL_USERNAME = os.environ["CHANNEL_USERNAME"].lstrip("@")
+ADMIN_CHAT_ID = int(os.environ["ADMIN_CHAT_ID"])
 
-CONSUMER_KEY = "lMJxZnjBrG1YzOYGWF7x2Y6LQ"
-CONSUMER_SECRET = "ScSEcm6NdWYBAa67M4RShFpFZJJWrQd0Bykp2piwOlZXUndJSz"
-ACCESS_TOKEN = "1967370507973799936-7LWfSTuf0Wvd75v39ZDs2OUZEsJMUj"
-ACCESS_SECRET = "SRJtr3ksZNKACYBTJU09BY4d9QOpeXxdh8Lp8flznIEk3"
-BEARER_TOKEN = "AAAAAAAAAAAAAAAAAAAAADjP4AEAAAAAmSEqm3wbGorfWAgj0lCihNIOCOo%3DzWLXcixd8lyLWH99CbIhvkpT4JLf8qkd4xUUeLc1bxntsobBEB"
+CONSUMER_KEY = os.environ["CONSUMER_KEY"]
+CONSUMER_SECRET = os.environ["CONSUMER_SECRET"]
+ACCESS_TOKEN = os.environ["ACCESS_TOKEN"]
+ACCESS_SECRET = os.environ["ACCESS_SECRET"]
+BEARER_TOKEN = os.environ["BEARER_TOKEN"]
 # -------------------------------------------------------------------------
 
 HASH_TRACK_FILE = Path("posted_hashes.txt")
