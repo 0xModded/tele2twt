@@ -50,7 +50,7 @@ It lets you **schedule/post photos, videos, or album threads** for future postin
     - `#at 2025-09-18 10:00` — Schedule for specific **UTC time**.
     - No tag? Posts as soon as possible.
 
-### ** DM Commands**
+### **DM Commands**
 
 - `/ping` — Check if bot is running.
 - `/lastpost` — Get latest tweet URL/caption.
