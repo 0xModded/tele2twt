@@ -5,9 +5,10 @@ import logging
 import json
 import re
 import sqlite3
+import time
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
-from typing import Optional, List
+from typing import Optional, List, Tuple, Dict
 
 import tweepy
 from telegram import Update
@@ -18,8 +19,15 @@ from telegram.ext import (
     ContextTypes,
     CommandHandler,
 )
-
 from dotenv import load_dotenv
+
+# --- nest_asyncio for Jupyter/Windows safe loop patching ---
+try:
+    import nest_asyncio
+    nest_asyncio.apply()
+except ImportError:
+    pass
+
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
@@ -49,12 +57,15 @@ def db_init():
             "media_paths TEXT, caption TEXT, scheduled_time INTEGER)"
         )
         conn.commit()
+
 def db_add_queue_item(paths: List[str], caption: str, scheduled_time: int):
     with sqlite3.connect(DB_FILE) as conn:
         conn.execute(
             "INSERT INTO queue (media_paths, caption, scheduled_time) VALUES (?, ?, ?)",
             (json.dumps(paths), caption, scheduled_time)
-        ); conn.commit()
+        )
+        conn.commit()
+
 def db_get_next_items(n=5):
     with sqlite3.connect(DB_FILE) as conn:
         cur = conn.execute(
@@ -62,6 +73,7 @@ def db_get_next_items(n=5):
             "ORDER BY scheduled_time ASC LIMIT ?", (n,)
         )
         return cur.fetchall()
+
 def db_pop_due_items():
     now = int(datetime.now(timezone.utc).timestamp())
     with sqlite3.connect(DB_FILE) as conn:
@@ -75,6 +87,7 @@ def db_pop_due_items():
             conn.executemany("DELETE FROM queue WHERE id=?", [(id,) for id in ids])
         conn.commit()
     return rows
+
 def db_clear_queue():
     with sqlite3.connect(DB_FILE) as conn:
         conn.execute("DELETE FROM queue")
@@ -97,22 +110,17 @@ def parse_schedule_from_caption(caption: str) -> Optional[int]:
     m = re.search(r"#in\s+([0-9]+)\s*m(?:in)?", caption)
     if m:
         mins = int(m.group(1))
-        ts = int((datetime.now(timezone.utc) + timedelta(minutes=mins)).timestamp())
-        return ts
+        return int((datetime.now(timezone.utc) + timedelta(minutes=mins)).timestamp())
     m = re.search(r"#in\s+([0-9]+)\s*h(?:our)?", caption)
     if m:
         hrs = int(m.group(1))
-        ts = int((datetime.now(timezone.utc) + timedelta(hours=hrs)).timestamp())
-        return ts
+        return int((datetime.now(timezone.utc) + timedelta(hours=hrs)).timestamp())
     return None
 
 def strip_schedule_from_caption(caption: str) -> str:
-    # Remove #in 23m, #in 2h, #at 2025-09-17 19:30, etc.
     caption = re.sub(r"#in\s+\d+\s*[mh](in|our)?", "", caption, flags=re.IGNORECASE)
     caption = re.sub(r"#at\s+[0-9\-: Tt]+", "", caption, flags=re.IGNORECASE)
-    # Remove any extra whitespace
     return re.sub(r"\s+", " ", caption).strip()
-
 
 # ======= Twitter/Tweepy Setup ==========
 def hash_file(filepath: str) -> str:
@@ -135,225 +143,299 @@ client = tweepy.Client(
 v1_auth = tweepy.OAuth1UserHandler(CONSUMER_KEY, CONSUMER_SECRET, ACCESS_TOKEN, ACCESS_SECRET)
 api_v1 = tweepy.API(v1_auth)
 
-# ======= Last post info (for /lastpost) ==========
-def save_last_post(tweet_url: str, caption: str):
-    with open(LAST_POST_FILE, "w", encoding="utf-8") as f:
-        f.write(f"{tweet_url}\n{caption}\n")
-def load_last_post() -> Optional[tuple]:
-    if not LAST_POST_FILE.exists():
-        return None
-    lines = LAST_POST_FILE.read_text(encoding="utf-8").splitlines()
-    if len(lines) < 2:
-        return None
-    return lines[0], lines[1]
+# ======= Album Buffering (with debounce) ===========
+pending_albums: Dict[Tuple[int, str], List[Dict]] = {}
+pending_album_tasks: Dict[Tuple[int, str], asyncio.Task] = {}
 
-# ======= Pending Approval State ==========
-pending_duplicate_approval = {"future": None, "media_info": None}
-async def wait_for_approval(context: ContextTypes.DEFAULT_TYPE, media_info, timeout: int = 120) -> bool:
-    loop = asyncio.get_event_loop()
-    fut = loop.create_future()
-    pending_duplicate_approval["future"] = fut
-    pending_duplicate_approval["media_info"] = media_info
-    await context.bot.send_message(
-        chat_id=ADMIN_CHAT_ID,
-        text="⚠️ Duplicate media detected. Send /ok in the bot's chat within 2 minutes to force-post."
-    )
-    try:
-        await asyncio.wait_for(fut, timeout)
-        return True
-    except asyncio.TimeoutError:
-        await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text="⏱️ Duplicate post request timed out; skipping.")
-        return False
-    finally:
-        pending_duplicate_approval["future"] = None
-        pending_duplicate_approval["media_info"] = None
-async def approve_duplicate(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not user or user.id != ADMIN_CHAT_ID:
-        try:
-            await update.effective_message.reply_text("You are not authorized to approve duplicates.")
-        except Exception:
-            log.info("Could not reply to unauthorized /ok sender.")
-        return
-    fut = pending_duplicate_approval.get("future")
-    if fut and not fut.done():
-        fut.set_result(True)
-        try:
-            await update.effective_message.reply_text("Duplicate approved — posting now.")
-        except Exception:
-            log.info("Failed to send approval reply to admin.")
-        log.info("Duplicate approved by admin.")
-    else:
-        try:
-            await update.effective_message.reply_text("No duplicate is currently awaiting approval.")
-        except Exception:
-            log.info("Failed to inform admin no duplicate was pending.")
-        log.info("Admin issued /ok but nothing pending.")
+# ======= Duplicate approval storage ===========
+pending_approvals: Dict[str, Dict] = {}
 
-# ========= Album Buffering ===========
-pending_albums = {}
-ALBUM_FINALIZE_DELAY = 2.5  # seconds
+def _new_approval_id() -> str:
+    return str(int(time.time() * 1000))
 
 async def finalize_album(chat_id, group_id, context):
-    await asyncio.sleep(ALBUM_FINALIZE_DELAY)
     key = (chat_id, group_id)
+    pending_album_tasks.pop(key, None)
     items = pending_albums.pop(key, None)
     if not items:
         return
-    caption = items[0]['caption']
-    post_time = parse_schedule_from_caption(caption)
-    if post_time is None:
-        post_time = int(datetime.now(timezone.utc).timestamp())
-    filepaths = [i['file'] for i in items]
-    clean_caption = strip_schedule_from_caption(caption)
-    db_add_queue_item(filepaths, clean_caption, post_time)
 
-    await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=
-        f"Album queued for {datetime.fromtimestamp(post_time, timezone.utc):%Y-%m-%d %H:%M UTC}")
+    caption = items[0]['caption']
+    post_time = parse_schedule_from_caption(caption) or int(datetime.now(timezone.utc).timestamp())
+    clean_caption = strip_schedule_from_caption(caption)
+
+    videos = [i for i in items if i['type'] == 'video']
+    photos = [i for i in items if i['type'] == 'photo']
+    others = [i for i in items if i['type'] not in ('video', 'photo')]
+
+    if len(videos) == 1 and photos:
+        media_paths = [videos[0]['file']] + [p['file'] for p in photos]
+        db_add_queue_item(media_paths, clean_caption, post_time)
+    elif len(videos) > 1:
+        media_paths = [v['file'] for v in videos] + [p['file'] for p in photos] + [o['file'] for o in others]
+        db_add_queue_item(media_paths, clean_caption, post_time)
+    elif photos:
+        media_paths = [p['file'] for p in photos[:4]]
+        db_add_queue_item(media_paths, clean_caption, post_time)
+    else:
+        media_paths = [items[0]['file']]
+        db_add_queue_item(media_paths, clean_caption, post_time)
+
+    # keep informative queued notification
+    await context.bot.send_message(
+        chat_id=ADMIN_CHAT_ID,
+        text=f"Album queued for {datetime.fromtimestamp(post_time, timezone.utc):%Y-%m-%d %H:%M UTC}"
+    )
+
+def infer_type_from_document(msg) -> str:
+    doc = getattr(msg, "document", None)
+    if not doc:
+        return "document"
+    mime = getattr(doc, "mime_type", "") or ""
+    fname = getattr(doc, "file_name", "") or ""
+    mime = mime.lower()
+    fname = fname.lower()
+    if "image" in mime or fname.endswith((".jpg", ".jpeg", ".png", ".gif", ".webp")):
+        return "photo"
+    if "video" in mime or fname.endswith((".mp4", ".mov", ".mkv", ".webm")):
+        return "video"
+    return "document"
+
+async def _delayed_finalize(key: Tuple[int, str], context: ContextTypes.DEFAULT_TYPE, delay: float = 1.8):
+    try:
+        await asyncio.sleep(delay)
+        await finalize_album(key[0], key[1], context)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        pending_album_tasks.pop(key, None)
 
 async def media_to_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
-    if not msg: return
-    chat = msg.chat
-    if not chat or getattr(chat, "username", None) != CHANNEL_USERNAME:
+    if not msg:
         return
+
+    chat_obj = msg.chat
+    if not chat_obj or getattr(chat_obj, "username", None) != CHANNEL_USERNAME:
+        return
+
     caption = msg.caption if getattr(msg, "caption", None) else (msg.text if getattr(msg, "text", None) else "Sent from Telegram")
 
     async def dl_file(file_obj):
         tg_file = await file_obj.get_file()
         saved = await tg_file.download_to_drive()
         return str(saved)
-    # Album handling
+
+    media_type = None
+    file_path = None
+
+    if getattr(msg, "video", None):
+        media_type = 'video'
+        file_path = await dl_file(msg.video)
+    elif getattr(msg, "photo", None):
+        media_type = 'photo'
+        file_path = await dl_file(msg.photo[-1])
+    elif getattr(msg, "document", None):
+        media_type = infer_type_from_document(msg)
+        file_path = await dl_file(msg.document)
+
     if getattr(msg, "media_group_id", None):
-        key = (chat.id, msg.media_group_id)
-        file_path = None
-        if getattr(msg, "video", None):
-            file_path = await dl_file(msg.video)
-        elif getattr(msg, "photo", None):
-            file_path = await dl_file(msg.photo[-1])
-        elif getattr(msg, "document", None):
-            file_path = await dl_file(msg.document)
-        else:
-            return
-        pending_albums.setdefault(key, []).append({'file': file_path, 'caption': caption})
-        # Start or refresh finalizer task for this group
-        if not any(x for x in asyncio.all_tasks() if getattr(x, 'album_key', None) == key):
-            t = asyncio.create_task(finalize_album(chat.id, msg.media_group_id, context))
-            t.album_key = key  # for deduping
+        key = (chat_obj.id, msg.media_group_id)
+        pending_albums.setdefault(key, []).append({'file': file_path, 'caption': caption, 'type': media_type})
+
+        existing = pending_album_tasks.get(key)
+        if existing and not existing.done():
+            existing.cancel()
+        task = asyncio.create_task(_delayed_finalize(key, context, delay=1.8))
+        pending_album_tasks[key] = task
+
     else:
-        file_path = None
-        if getattr(msg, "video", None):
-            file_path = await dl_file(msg.video)
-        elif getattr(msg, "photo", None):
-            file_path = await dl_file(msg.photo[-1])
-        elif getattr(msg, "document", None):
-            file_path = await dl_file(msg.document)
-        else:
-            return
-        post_time = parse_schedule_from_caption(caption)
-        if post_time is None:
-            post_time = int(datetime.now(timezone.utc).timestamp())
+        post_time = parse_schedule_from_caption(caption) or int(datetime.now(timezone.utc).timestamp())
         clean_caption = strip_schedule_from_caption(caption)
-        db_add_queue_item([file_path], clean_caption, post_time)
+        if file_path:
+            db_add_queue_item([file_path], clean_caption, post_time)
+        else:
+            db_add_queue_item([], clean_caption, post_time)
 
         await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=
             f"Queued post for {datetime.fromtimestamp(post_time, timezone.utc):%Y-%m-%d %H:%M UTC}")
 
-# ============= Posting Logic (dequeue) ===============
-async def process_and_post_media(file_paths: list[str], caption: str, context: ContextTypes.DEFAULT_TYPE):
-    hashes = [hash_file(p) for p in file_paths]
-    duplicate = any(h in HASH_TRACK_FILE.read_text().splitlines() if HASH_TRACK_FILE.exists() else [] for h in hashes)
-    if duplicate:
-        approved = await wait_for_approval(context, {"files": file_paths})
-        if not approved:
-            for f in file_paths:
-                try: os.remove(f)
-                except Exception: pass
-            return
-
-    reply_to_id = None
-    tweet_url = None
-    try:
-        user_id = ACCESS_TOKEN.split('-')[0]
-        video_path = next((p for p in file_paths if p.lower().endswith((".mp4", ".mov", ".mkv", ".webm"))), None)
-        photo_paths = [p for p in file_paths if p != video_path]
-        # Video tweet (if present)
-        if video_path:
-            try:
-                media = api_v1.media_upload(video_path)
-                res = client.create_tweet(text=caption if not photo_paths else caption + " (video)", media_ids=[media.media_id_string])
-                if getattr(res, "data", None) and res.data.get("id"):
-                    reply_to_id = res.data["id"]
-                    tweet_url = f"https://twitter.com/{user_id}/status/{reply_to_id}"
-                    save_last_post(tweet_url, caption)
-                h = hash_file(video_path)
-                with open(HASH_TRACK_FILE, "a") as f:
-                    f.write(h + "\n")
-            except Exception as e:
-                log.exception("Failed to post video: %s", e)
-        # Photos reply (group)
-        if photo_paths:
-            media_ids = []
-            for path in photo_paths:
-                try:
-                    media = api_v1.media_upload(path)
-                    media_ids.append(media.media_id_string)
-                except Exception as e:
-                    log.exception("Failed to upload photo %s: %s", path, e)
-            if media_ids:
-                res = client.create_tweet(
-                    text=caption if not video_path else caption + " (photos)",
-                    media_ids=media_ids,
-                    in_reply_to_tweet_id=reply_to_id
-                )
-                if getattr(res, "data", None) and res.data.get("id"):
-                    thread_url = f"https://twitter.com/{user_id}/status/{res.data['id']}"
-                    save_last_post(thread_url, caption)
-                for path in photo_paths:
-                    h = hash_file(path)
-                    with open(HASH_TRACK_FILE, "a") as f:
-                        f.write(h + "\n")
-        elif not video_path:  # pure text fallback—rare but possible
-            try:
-                res = client.create_tweet(text=caption)
-                if getattr(res, "data", None) and res.data.get("id"):
-                    tweet_url = f"https://twitter.com/{user_id}/status/{res.data['id']}"
-                    save_last_post(tweet_url, caption)
-            except Exception as e:
-                log.exception("Failed to post text tweet: %s", e)
-
-        await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text="✅ Telegram bot: Posted to Twitter successfully!")
-    except Exception as e:
-        log.exception("Error while posting to Twitter: %s", e)
-        try:
-            await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=f"❌ Telegram-to-Twitter Error:\n{e}")
-        except Exception:
-            pass
-    finally:
-        for p in file_paths:
-            try: os.remove(p)
-            except Exception: pass
-
-# ============== Scheduled Poster ==================
-async def scheduled_poster(context: ContextTypes.DEFAULT_TYPE):
-    to_post = db_pop_due_items()
-    for row in to_post:
-        id, media_paths, caption, scheduled_time = row
-        files = json.loads(media_paths)
-        await process_and_post_media(files, caption, context)
-
-# ============== Admin Command Handlers =============
-async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text("✅ Bot is up and running.")
-
-async def lastpost(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    post = load_last_post()
-    if post is None:
-        await update.effective_message.reply_text("No post has been made yet.")
+# ============= Posting Logic & Approval Handling ==============
+async def _post_media_now(file_paths: list, caption: str, context: ContextTypes.DEFAULT_TYPE):
+    if not file_paths:
+        client.create_tweet(text=caption)
+        if context:
+            await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=f"✅ Twitter post successful!\nCaption: {caption[:100]}")
         return
-    url, caption = post
-    await update.effective_message.reply_text(f"Last post:\n{url}\nCaption: {caption}")
 
+    videos = [p for p in file_paths if p.lower().endswith((".mp4", ".mov", ".mkv", ".webm"))]
+    photos = [p for p in file_paths if p.lower().endswith((".jpg", ".jpeg", ".png", ".gif", ".webp"))]
+    others = [p for p in file_paths if p not in videos and p not in photos]
+
+    try:
+        if len(videos) == 1 and photos:
+            vid_media = api_v1.media_upload(videos[0])
+            main_tweet = client.create_tweet(text=caption, media_ids=[vid_media.media_id])
+            main_id = main_tweet.data["id"]
+            await asyncio.sleep(1)
+            for p in photos:
+                m = api_v1.media_upload(p)
+                client.create_tweet(text=caption, media_ids=[m.media_id], in_reply_to_tweet_id=main_id)
+                await asyncio.sleep(1)
+            for o in others:
+                m = api_v1.media_upload(o)
+                client.create_tweet(text="", media_ids=[m.media_id], in_reply_to_tweet_id=main_id)
+                await asyncio.sleep(1)
+
+        elif len(videos) > 1:
+            main_media = api_v1.media_upload(videos[0])
+            main_tweet = client.create_tweet(text=caption, media_ids=[main_media.media_id])
+            main_id = main_tweet.data["id"]
+            await asyncio.sleep(1)
+            for v in videos[1:]:
+                vm = api_v1.media_upload(v)
+                client.create_tweet(text="", media_ids=[vm.media_id], in_reply_to_tweet_id=main_id)
+                await asyncio.sleep(1)
+            for p in photos + others:
+                pm = api_v1.media_upload(p)
+                client.create_tweet(text="", media_ids=[pm.media_id], in_reply_to_tweet_id=main_id)
+                await asyncio.sleep(1)
+
+        else:
+            media_ids = []
+            for mpath in file_paths[:4]:
+                m = api_v1.media_upload(mpath)
+                media_ids.append(m.media_id)
+                await asyncio.sleep(1)
+            client.create_tweet(text=caption, media_ids=media_ids if media_ids else None)
+
+        with open(HASH_TRACK_FILE, "a", encoding="utf-8") as f:
+            for p in file_paths:
+                try:
+                    h = hash_file(p)
+                    f.write(h + "\n")
+                except Exception:
+                    pass
+
+        if context:
+            try:
+                await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=f"✅ Twitter post successful!\nCaption: {caption[:100]}")
+            except Exception as notify_e:
+                log.warning(f"Could not send success DM: {notify_e}")
+
+    except tweepy.errors.TooManyRequests:
+        db_add_queue_item(file_paths, caption, int(datetime.now(timezone.utc).timestamp()) + 900)
+        log.warning("⚠️ Twitter rate limit (429). Requeued post for +15 minutes.")
+        if context:
+            await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text="❌ Twitter post failed with rate limit (429). Requeued +15 min.")
+    except Exception as e:
+        db_add_queue_item(file_paths, caption, int(datetime.now(timezone.utc).timestamp()) + 60)
+        log.error(f"Failed posting tweet: {e}")
+        if context:
+            await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=f"❌ Twitter post failed, requeued. Reason: {str(e)}")
+
+async def process_and_post_media(file_paths: list, caption: str, context: ContextTypes.DEFAULT_TYPE):
+    if not file_paths:
+        try:
+            client.create_tweet(text=caption)
+            await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=f"✅ Twitter post successful!\nCaption: {caption[:100]}")
+        except Exception as e:
+            log.error(f"Failed posting tweet: {e}")
+        return
+
+    hashes = [hash_file(p) for p in file_paths]
+    existing_text = HASH_TRACK_FILE.read_text(encoding="utf-8") if HASH_TRACK_FILE.exists() else ""
+    is_dup = any(h in existing_text for h in hashes)
+
+    if is_dup:
+        approval_id = _new_approval_id()
+        pending_approvals[approval_id] = {
+            "media_paths": file_paths,
+            "caption": caption,
+            "created_at": int(time.time())
+        }
+        file_list = "\n".join(file_paths[:8]) + (f"\n...(+{len(file_paths)-8} more)" if len(file_paths) > 8 else "")
+        await context.bot.send_message(
+            chat_id=ADMIN_CHAT_ID,
+            text=(
+                f"⚠️ Duplicate detected for queued post (approval id: {approval_id}).\n\n"
+                f"Files:\n{file_list}\n\n"
+                f"Caption preview: {caption[:200]}\n\n"
+                f"To approve posting anyway, send: /ok {approval_id}\n"
+                f"To ignore this item, send: /ignore {approval_id}"
+            )
+        )
+        log.info(f"Duplicate detected, approval {approval_id} requested.")
+        return
+
+    await _post_media_now(file_paths, caption, context)
+
+# Command handlers for approval
+async def ok_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != ADMIN_CHAT_ID:
+        await update.effective_message.reply_text("You are not authorized to approve.")
+        return
+
+    args = context.args or []
+    approval_id = None
+    if args:
+        approval_id = args[0].strip()
+    else:
+        if len(pending_approvals) == 1:
+            approval_id = next(iter(pending_approvals.keys()))
+
+    if not approval_id or approval_id not in pending_approvals:
+        await update.effective_message.reply_text("No matching pending approval found. Provide `/ok <id>`.")
+        return
+
+    item = pending_approvals.pop(approval_id)
+    await update.effective_message.reply_text(f"Approval {approval_id} received — posting now.")
+    await _post_media_now(item["media_paths"], item["caption"], context)
+
+async def ignore_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != ADMIN_CHAT_ID:
+        await update.effective_message.reply_text("You are not authorized to ignore.")
+        return
+
+    args = context.args or []
+    approval_id = None
+    if args:
+        approval_id = args[0].strip()
+    else:
+        if len(pending_approvals) == 1:
+            approval_id = next(iter(pending_approvals.keys()))
+
+    if not approval_id or approval_id not in pending_approvals:
+        await update.effective_message.reply_text("No matching pending approval found. Provide `/ignore <id>`.")
+        return
+
+    pending_approvals.pop(approval_id, None)
+    await update.effective_message.reply_text(f"Ignored pending approval {approval_id}.")
+
+async def list_approvals_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != ADMIN_CHAT_ID:
+        await update.effective_message.reply_text("You are not authorized.")
+        return
+    if not pending_approvals:
+        await update.effective_message.reply_text("No pending approvals.")
+        return
+    lines = []
+    for aid, item in pending_approvals.items():
+        created = datetime.fromtimestamp(item["created_at"], timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        lines.append(f"{aid}: {len(item['media_paths'])} files queued at {created} — preview: {item['caption'][:80]}")
+    await update.effective_message.reply_text("\n".join(lines))
+
+async def process_queue(context: ContextTypes.DEFAULT_TYPE):
+    items = db_pop_due_items()
+    for item in items:
+        _, media_json, caption, _ = item
+        media_paths = json.loads(media_json)
+        await process_and_post_media(media_paths, caption, context)
+
+async def scheduled_poster(context: ContextTypes.DEFAULT_TYPE):
+    await process_queue(context)
+
+# ============= Basic Commands =============
 async def show_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = db_get_next_items(10)
     if not rows:
@@ -366,28 +448,43 @@ async def show_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
         preview = (row[2][:50] + "...") if row[2] and len(row[2]) > 50 else row[2]
         msgs.append(f"ID {row[0]}: {files} scheduled {when}\nCaption: {preview}")
     await update.effective_message.reply_text("\n\n".join(msgs))
+
 async def clear_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db_clear_queue()
     await update.effective_message.reply_text("Queue cleared.")
 
-# ===================== Launch ======================
-if __name__ == "__main__":
-    db_init()
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    app.job_queue.run_repeating(scheduled_poster, interval=60, first=1)
+async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text("✅ Bot is up and running.")
 
-    app.add_handler(CommandHandler("ping", ping))
-    app.add_handler(CommandHandler("lastpost", lastpost))
-    app.add_handler(CommandHandler("queue", show_queue))
-    app.add_handler(CommandHandler("clearqueue", clear_queue))
-    app.add_handler(CommandHandler("ok", approve_duplicate))
-    app.add_handler(
-        MessageHandler(
-            filters.Regex(r"^/ok(?:@[\w_]+)?$") & filters.Chat(chat_id=ADMIN_CHAT_ID),
-            approve_duplicate,
-        )
+# ============= Main =============
+async def main():
+    db_init()
+    application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+
+    application.job_queue.run_repeating(
+        scheduled_poster, interval=60, first=5
     )
 
-    app.add_handler(MessageHandler(filters.ALL & filters.Chat(username=CHANNEL_USERNAME), media_to_queue))
-    log.info("Starting bot polling...")
-    app.run_polling()
+    application.add_handler(CommandHandler("ok", ok_command))
+    application.add_handler(CommandHandler("ignore", ignore_command))
+    application.add_handler(CommandHandler("approvals", list_approvals_command))
+    application.add_handler(CommandHandler("queue", show_queue))
+    application.add_handler(CommandHandler("clearqueue", clear_queue))
+    application.add_handler(CommandHandler("ping", ping))
+
+    application.add_handler(
+        MessageHandler(filters.ALL & ~filters.COMMAND, media_to_queue)
+    )
+
+    log.info("Bot started.")
+    await application.run_polling()
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except RuntimeError as e:
+        if "already running" in str(e):
+            loop = asyncio.get_event_loop()
+            loop.run_until_complete(main())
+        else:
+            raise
