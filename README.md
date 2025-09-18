@@ -56,7 +56,9 @@ It lets you **schedule/post photos, videos, or album threads** for future postin
 - `/lastpost` — Get latest tweet URL/caption.
 - `/queue` — Show next scheduled posts.
 - `/clearqueue` — Remove all pending scheduled posts.
-- `/ok` — Approve duplicate post when prompted.
+- `/ok [id]` — Approve duplicate post when prompted.
+- `/ignore [id]` — Ignore a pending duplicate approval
+- `/approval` — See pending duplicate approvals
 
 ---
 
