@@ -9,6 +9,9 @@ import time
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Tuple, Dict
+import logging
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger(__name__)
 
 import tweepy
 from telegram import Update
@@ -21,12 +24,13 @@ from telegram.ext import (
 )
 from dotenv import load_dotenv
 
-# --- nest_asyncio for Jupyter/Windows safe loop patching ---
-try:
-    import nest_asyncio
-    nest_asyncio.apply()
-except ImportError:
-    pass
+if os.environ.get("TELE2TWT_ALLOW_NEST_ASYNCIO", "").lower() in ("1", "true", "yes"):
+    try:
+        import nest_asyncio
+        nest_asyncio.apply()
+        log.info("nest_asyncio applied (dev mode).")
+    except Exception:
+        log.exception("Failed to apply nest_asyncio")
 
 load_dotenv()
 
@@ -457,34 +461,74 @@ async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text("✅ Bot is up and running.")
 
 # ============= Main =============
-async def main():
+def main():
     db_init()
     application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
-    application.job_queue.run_repeating(
-        scheduled_poster, interval=60, first=5
-    )
+    # If you added handlers earlier in your file, keep them; otherwise add here
+    application.add_handler(CommandHandler("queue", show_queue))
+    application.add_handler(CommandHandler("clearqueue", clear_queue))
+    application.add_handler(CommandHandler("ping", ping))
 
     application.add_handler(CommandHandler("ok", ok_command))
     application.add_handler(CommandHandler("ignore", ignore_command))
     application.add_handler(CommandHandler("approvals", list_approvals_command))
-    application.add_handler(CommandHandler("queue", show_queue))
-    application.add_handler(CommandHandler("clearqueue", clear_queue))
-    application.add_handler(CommandHandler("ping", ping))
 
     application.add_handler(
         MessageHandler(filters.ALL & ~filters.COMMAND, media_to_queue)
     )
 
+    # Start scheduled poster: prefer job_queue, otherwise fallback to asyncio task
+    if getattr(application, "job_queue", None) is not None:
+        try:
+            application.job_queue.run_repeating(scheduled_poster, interval=60, first=5)
+            log.info("Started scheduled_poster via application.job_queue")
+        except Exception:
+            log.exception("Failed to start scheduled_poster via job_queue; will use asyncio fallback")
+            application.job_queue = None
+
+    if getattr(application, "_periodic_task", None):
+        # `_periodic_task` is set earlier as coroutine function; create the background task via Application's create_task
+        # Application provides create_task on its event loop when run_polling starts, but we can schedule it using application.create_task
+        # after initialization. We'll use the Application.run_polling lifecycle to safely schedule it.
+        async def _start_periodic_task_on_app_startup(app):
+            # wait until the application is initialized and running
+            await asyncio.sleep(0.1)
+            # create the task
+            app.create_task(app._periodic_task())
+            log.info("Started fallback periodic process_queue task")
+
+        # register a startup callback to create the task
+        application.post_init = getattr(application, "post_init", None)
+        # We'll schedule the helper to run when run_polling starts by wrapping run_polling below.
+
     log.info("Bot started.")
-    await application.run_polling()
+
+    # run the bot (synchronous call; PTB manages the event loop)
+    # If we need to create fallback background task, start it before calling run_polling
+    # (application.initialize/start handled inside run_polling)
+    try:
+        # If fallback task is required, create and schedule it on the running loop by wrapping run_polling
+        if getattr(application, "_periodic_task", None):
+            # create a wrapper coroutine that schedules the fallback task then runs polling
+            async def _run_with_startup():
+                # schedule periodic task
+                app = application
+                app.create_task(app._periodic_task())
+                # now run polling (this will block until shutdown)
+                await app.run_polling()
+            # run polling by executing the wrapper
+            # Because we're in a synchronous main, call run() on asyncio to run the wrapper
+            asyncio.run(_run_with_startup())
+        else:
+            # normal sync run (this call will manage the loop)
+            application.run_polling()
+    except KeyboardInterrupt:
+        log.info("Shutting down by user interrupt")
+    except Exception:
+        log.exception("Unexpected error in main()")
+
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except RuntimeError as e:
-        if "already running" in str(e):
-            loop = asyncio.get_event_loop()
-            loop.run_until_complete(main())
-        else:
-            raise
+    main()
+
